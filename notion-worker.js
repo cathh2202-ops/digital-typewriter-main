@@ -50,7 +50,7 @@ export default {
         `https://api.notion.com/v1/blocks/${pageId}/children`,
         {
           headers: {
-            'Authorization': `Bearer ${env.NOTION_API_KEY}`,
+            'Authorization': `Bearer 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`,
             'Notion-Version': '2022-06-28',
           },
         }
