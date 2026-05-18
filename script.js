@@ -12,12 +12,12 @@ const CONFIG = {
 
   // 3. Your Cloudflare Worker URL (after deploying notion-worker.js)
   //    e.g. 'https://notion-proxy.yourname.workers.dev'
-  NOTION_WORKER_URL: 'https://digital-typewriter-main.cathh2202.workers.dev/',
+  NOTION_WORKER_URL: 'notion-proxy.cathh2202.workers.dev',
 
   // 4. Your Notion database ID — the long hex string in the URL when you open the DB view
   //    e.g. notion.so/yourname/DATABASE_ID?v=...
   //    For a plain page with to-do checkboxes, use the PAGE ID instead and set IS_DATABASE = false
-  NOTION_DATABASE_ID: '2c2e8830891280c28bc4000cdfaac5e0',
+  NOTION_DATABASE_ID: '364e883089128109abdccc64eb0e7fcb',
 
   // Set to false if your Notion page uses inline to-do blocks (not a full Database)
   IS_DATABASE: true,
