@@ -1,3 +1,29 @@
+// ============================================================
+// CONFIGURATION — fill these in before opening index.html
+// ============================================================
+const CONFIG = {
+  // 1. Google Cloud Console → APIs & Services → Credentials → Create OAuth 2.0 Client ID (Web)
+  //    Add http://localhost:PORT and your live URL to "Authorised JavaScript origins"
+  GOOGLE_CLIENT_ID: '372466667296-aqnhhvh35ftg5o0o3jirbdui5g3bsrmv.apps.googleusercontent.com',
+
+  // 2. Google Cloud Console → APIs & Services → Credentials → Create API Key
+  //    Restrict it to "Google Calendar API"
+  GOOGLE_API_KEY: 'AIzaSyBKnjkGHHuFN0h5eIemaXu2qYk6zVYyEMU',
+
+  // 3. Your Cloudflare Worker URL (after deploying notion-worker.js)
+  //    e.g. 'https://notion-proxy.yourname.workers.dev'
+  NOTION_WORKER_URL: 'https://digital-typewriter-main.cathh2202.workers.dev/',
+
+  // 4. Your Notion database ID — the long hex string in the URL when you open the DB view
+  //    e.g. notion.so/yourname/DATABASE_ID?v=...
+  //    For a plain page with to-do checkboxes, use the PAGE ID instead and set IS_DATABASE = false
+  NOTION_DATABASE_ID: '2c2e8830891280c28bc4000cdfaac5e0',
+
+  // Set to false if your Notion page uses inline to-do blocks (not a full Database)
+  IS_DATABASE: true,
+};
+// ============================================================
+
 const stage = document.getElementById('stage');
 const receipt = document.getElementById('receipt');
 const printBtn = document.getElementById('printBtn');
@@ -9,6 +35,263 @@ const randomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
 // --- Receipt date stamp ---
 const today = new Date();
 receiptDate.textContent = `${today.getMonth() + 1}/${today.getDate()}/${today.getFullYear()}`;
+
+// ============================================================
+// GOOGLE CALENDAR INTEGRATION
+// ============================================================
+
+function loadGoogleAPI() {
+  return new Promise((resolve) => {
+    const script = document.createElement('script');
+    script.src = 'https://apis.google.com/js/api.js';
+    script.onload = resolve;
+    document.head.appendChild(script);
+  });
+}
+
+function loadGoogleIdentity() {
+  return new Promise((resolve) => {
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.onload = resolve;
+    document.head.appendChild(script);
+  });
+}
+
+async function initGoogleCalendar() {
+  await Promise.all([loadGoogleAPI(), loadGoogleIdentity()]);
+
+  await new Promise((resolve) => gapi.load('client', resolve));
+
+  await gapi.client.init({
+    apiKey: CONFIG.GOOGLE_API_KEY,
+    discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest'],
+  });
+
+  // Check if we already have a token in sessionStorage
+  const savedToken = sessionStorage.getItem('gcal_token');
+  if (savedToken) {
+    gapi.client.setToken(JSON.parse(savedToken));
+    return fetchTodayEvents();
+  }
+
+  // Otherwise prompt sign-in
+  return new Promise((resolve) => {
+    const tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CONFIG.GOOGLE_CLIENT_ID,
+      scope: 'https://www.googleapis.com/auth/calendar.readonly',
+      callback: (tokenResponse) => {
+        if (tokenResponse.error) { resolve([]); return; }
+        sessionStorage.setItem('gcal_token', JSON.stringify(gapi.client.getToken()));
+        fetchTodayEvents().then(resolve);
+      },
+    });
+
+    // Show a small sign-in nudge on the receipt
+    showCalendarSignInPrompt(() => tokenClient.requestAccessToken({ prompt: '' }));
+    resolve([]); // render existing HTML first; events will inject when auth completes
+  });
+}
+
+function showCalendarSignInPrompt(onClick) {
+  const eventsUl = document.querySelector('.events');
+  const existing = eventsUl.querySelectorAll('li');
+  if (existing.length) return; // already has hardcoded events, skip nudge
+
+  const li = document.createElement('li');
+  li.innerHTML = `<span class="event-icon event-personal"></span>
+    <span class="label" style="color:#EC6E9E;cursor:pointer;text-decoration:underline" id="gcal-signin">
+      sign in to load today's events
+    </span>`;
+  eventsUl.appendChild(li);
+  document.getElementById('gcal-signin').addEventListener('click', onClick);
+}
+
+async function fetchTodayEvents() {
+  const startOfDay = new Date(today);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(today);
+  endOfDay.setHours(23, 59, 59, 999);
+
+  try {
+    const response = await gapi.client.calendar.events.list({
+      calendarId: 'primary',
+      timeMin: startOfDay.toISOString(),
+      timeMax: endOfDay.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    return (response.result.items || []).map((ev) => ({
+      title: ev.summary || '(no title)',
+      start: ev.start?.dateTime ? formatTime(ev.start.dateTime) : 'all day',
+      end: ev.end?.dateTime ? formatTime(ev.end.dateTime) : '',
+      link: ev.hangoutLink || ev.htmlLink || null,
+      type: detectEventType(ev),
+    }));
+  } catch (err) {
+    console.warn('Google Calendar fetch failed:', err);
+    return [];
+  }
+}
+
+function formatTime(isoString) {
+  return new Date(isoString).toLocaleTimeString('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function detectEventType(ev) {
+  const title = (ev.summary || '').toLowerCase();
+  const workKeywords = ['standup', 'sync', 'meeting', 'review', 'sprint', 'planning', 'retro', '1:1', 'demo', 'work'];
+  return workKeywords.some((k) => title.includes(k)) ? 'work' : 'personal';
+}
+
+function renderEvents(events) {
+  const eventsUl = document.querySelector('.events');
+  eventsUl.innerHTML = ''; // clear hardcoded placeholder HTML
+
+  if (!events.length) {
+    eventsUl.innerHTML = '<li><span class="label" style="opacity:0.5">nothing scheduled today ✧</span></li>';
+    return;
+  }
+
+  events.forEach((ev) => {
+    const li = document.createElement('li');
+    const timeStr = ev.end ? `${ev.start}–${ev.end}` : ev.start;
+    li.innerHTML = `
+      <span class="event-icon event-${ev.type}">${ev.type}</span>
+      <span class="label">${ev.title}</span>
+      <span class="time">${timeStr}</span>
+      ${ev.link ? `<a href="${ev.link}" target="_blank" rel="noopener">link</a>` : ''}
+    `;
+    eventsUl.appendChild(li);
+  });
+
+  // Re-run the printer idle frame count with the actual event count
+  updatePrinterReaction(events.length);
+}
+
+// ============================================================
+// NOTION INTEGRATION
+// ============================================================
+
+async function fetchNotionTodos() {
+  try {
+    if (CONFIG.IS_DATABASE) {
+      // Query a Notion database for unchecked todo items
+      const res = await fetch(
+        `${CONFIG.NOTION_WORKER_URL}/notion/query?database_id=${CONFIG.NOTION_DATABASE_ID}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filter: {
+              property: 'Done',       // Change to match your checkbox property name
+              checkbox: { equals: false },
+            },
+            sorts: [{ property: 'Priority', direction: 'ascending' }],
+          }),
+        }
+      );
+      const data = await res.json();
+      return parseNotionDatabaseTodos(data);
+    } else {
+      // Fetch inline to-do blocks from a plain Notion page
+      const res = await fetch(
+        `${CONFIG.NOTION_WORKER_URL}/notion/page?page_id=${CONFIG.NOTION_DATABASE_ID}`
+      );
+      const data = await res.json();
+      return parseNotionPageTodos(data);
+    }
+  } catch (err) {
+    console.warn('Notion fetch failed:', err);
+    return [];
+  }
+}
+
+function parseNotionDatabaseTodos(data) {
+  if (!data.results) return [];
+  return data.results.map((page) => {
+    // Adjust property names below to match YOUR database columns
+    const titleProp = page.properties?.Name || page.properties?.Title;
+    const typeProp = page.properties?.Type || page.properties?.Category;
+
+    const title = titleProp?.title?.[0]?.plain_text || 'Untitled';
+    const rawType = typeProp?.select?.name || typeProp?.multi_select?.[0]?.name || '';
+    const type = rawType.toLowerCase().includes('work') ? 'work' : 'personal';
+
+    return { title, type };
+  });
+}
+
+function parseNotionPageTodos(data) {
+  if (!data.results) return [];
+  return data.results
+    .filter((block) => block.type === 'to_do' && !block.to_do?.checked)
+    .map((block) => {
+      const title = block.to_do?.rich_text?.[0]?.plain_text || 'Untitled';
+      return { title, type: 'personal' };
+    });
+}
+
+function renderTodos(todos) {
+  const todosUl = document.querySelector('.todos');
+  todosUl.innerHTML = ''; // clear hardcoded placeholder HTML
+
+  if (!todos.length) {
+    todosUl.innerHTML = '<li class="todo"><span class="label" style="opacity:0.5">all done! ✧</span></li>';
+    return;
+  }
+
+  todos.forEach((todo) => {
+    const li = document.createElement('li');
+    li.className = 'todo';
+    li.innerHTML = `
+      <span class="todo-icon todo-${todo.type}">${todo.type}</span>
+      <span class="label">${todo.title}</span>
+    `;
+    todosUl.appendChild(li);
+  });
+
+  // Re-attach sparkle click listeners after dynamic render
+  attachTodoClickListeners();
+}
+
+// ============================================================
+// BOOT — fetch both sources in parallel
+// ============================================================
+
+async function loadDailyData() {
+  const [events, todos] = await Promise.allSettled([
+    initGoogleCalendar(),
+    fetchNotionTodos(),
+  ]);
+
+  if (events.status === 'fulfilled' && events.value.length) {
+    renderEvents(events.value);
+  }
+
+  if (todos.status === 'fulfilled' && todos.value.length) {
+    renderTodos(todos.value);
+  }
+}
+
+loadDailyData();
+
+// const stage = document.getElementById('stage');
+// const receipt = document.getElementById('receipt');
+// const printBtn = document.getElementById('printBtn');
+// const printerText = document.querySelector('.printer-text');
+// const receiptDate = document.getElementById('receiptDate');
+
+// const randomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// // --- Receipt date stamp ---
+// const today = new Date();
+// receiptDate.textContent = `${today.getMonth() + 1}/${today.getDate()}/${today.getFullYear()}`;
 
 // --- Typewriter heading ---
 const HEADING_PREFIX = "Nasha's Daily ";
