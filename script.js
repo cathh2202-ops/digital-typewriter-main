@@ -12,12 +12,12 @@ const CONFIG = {
 
   // 3. Your Cloudflare Worker URL (after deploying notion-worker.js)
   //    e.g. 'https://notion-proxy.yourname.workers.dev'
-  NOTION_WORKER_URL: 'notion-proxy.cathh2202.workers.dev',
+  NOTION_WORKER_URL: 'https://digital-typewriter-main.cathh2202.workers.dev',
 
   // 4. Your Notion database ID — the long hex string in the URL when you open the DB view
   //    e.g. notion.so/yourname/DATABASE_ID?v=...
   //    For a plain page with to-do checkboxes, use the PAGE ID instead and set IS_DATABASE = false
-  NOTION_DATABASE_ID: '364e883089128109abdccc64eb0e7fcb',
+  NOTION_DATABASE_ID: '2c2e88308912806b9e30e9846a93fd78',
 
   // Set to false if your Notion page uses inline to-do blocks (not a full Database)
   IS_DATABASE: true,
@@ -34,7 +34,15 @@ const randomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 // --- Receipt date stamp ---
 const today = new Date();
+function formatDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 receiptDate.textContent = `${today.getMonth() + 1}/${today.getDate()}/${today.getFullYear()}`;
+const todayKey = formatDateKey(today);
 
 // ============================================================
 // GOOGLE CALENDAR INTEGRATION
@@ -57,39 +65,43 @@ function loadGoogleIdentity() {
     document.head.appendChild(script);
   });
 }
-
 async function initGoogleCalendar() {
+  console.log('1. Loading Google API...');
   await Promise.all([loadGoogleAPI(), loadGoogleIdentity()]);
+  console.log('2. Google API loaded');
 
   await new Promise((resolve) => gapi.load('client', resolve));
+  console.log('3. gapi client loaded');
 
   await gapi.client.init({
     apiKey: CONFIG.GOOGLE_API_KEY,
     discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest'],
   });
+  console.log('4. gapi client initialized');
 
-  // Check if we already have a token in sessionStorage
   const savedToken = sessionStorage.getItem('gcal_token');
+  console.log('5. Saved token:', savedToken ? 'found' : 'not found');
+  
   if (savedToken) {
     gapi.client.setToken(JSON.parse(savedToken));
     return fetchTodayEvents();
   }
 
-  // Otherwise prompt sign-in
   return new Promise((resolve) => {
     const tokenClient = google.accounts.oauth2.initTokenClient({
       client_id: CONFIG.GOOGLE_CLIENT_ID,
       scope: 'https://www.googleapis.com/auth/calendar.readonly',
       callback: (tokenResponse) => {
+        console.log('6. Token response:', tokenResponse);
         if (tokenResponse.error) { resolve([]); return; }
         sessionStorage.setItem('gcal_token', JSON.stringify(gapi.client.getToken()));
         fetchTodayEvents().then(resolve);
       },
     });
 
-    // Show a small sign-in nudge on the receipt
+    console.log('7. Requesting access token...');
     showCalendarSignInPrompt(() => tokenClient.requestAccessToken({ prompt: '' }));
-    resolve([]); // render existing HTML first; events will inject when auth completes
+    resolve([]);
   });
 }
 
@@ -178,40 +190,72 @@ function renderEvents(events) {
 // NOTION INTEGRATION
 // ============================================================
 
+function getNotionIds() {
+  return Array.isArray(CONFIG.NOTION_DATABASE_ID)
+    ? CONFIG.NOTION_DATABASE_ID
+    : [CONFIG.NOTION_DATABASE_ID];
+}
+
+async function fetchJson(url, options) {
+  const res = await fetch(url, options);
+  const data = await res.json();
+
+  if (!res.ok) {
+    console.warn('Notion request failed:', res.status, url, data);
+    return null;
+  }
+
+  return data;
+}
+
 async function fetchNotionTodos() {
   try {
-    if (CONFIG.IS_DATABASE) {
-      // Query a Notion database for unchecked todo items
-      const res = await fetch(
-        `${CONFIG.NOTION_WORKER_URL}/notion/query?database_id=${CONFIG.NOTION_DATABASE_ID}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filter: {
-              property: 'Done',       // Change to match your checkbox property name
-              checkbox: { equals: false },
-            },
-            sorts: [{ property: 'Priority', direction: 'ascending' }],
-          }),
-        }
-      );
-      const data = await res.json();
-      return parseNotionDatabaseTodos(data);
-    } else {
-      // Fetch inline to-do blocks from a plain Notion page
-      const res = await fetch(
-        `${CONFIG.NOTION_WORKER_URL}/notion/page?page_id=${CONFIG.NOTION_DATABASE_ID}`
-      );
-      const data = await res.json();
-      return parseNotionPageTodos(data);
+    const workerBase = CONFIG.NOTION_WORKER_URL.replace(/\/+$/, '');
+    const dateStr = todayKey; // "2026-05-18"
+
+    // Step 1: find today's page
+    const res = await fetch(
+      `${workerBase}/notion/query?database_id=${CONFIG.NOTION_DATABASE_ID}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filter: {
+            property: 'Date',
+            date: { equals: dateStr },
+          },
+        }),
+      }
+    );
+    const data = await res.json();
+    if (!data.results || !data.results.length) {
+      console.warn('No Notion page found for today:', dateStr);
+      return [];
     }
+
+    // Step 2: get the page ID and fetch its blocks
+    const pageId = data.results[0].id;
+    const blocksRes = await fetch(
+      `${workerBase}/notion/page?page_id=${pageId}`
+    );
+    const blocksData = await blocksRes.json();
+    return parseNotionPageTodos(blocksData);
+
   } catch (err) {
     console.warn('Notion fetch failed:', err);
     return [];
   }
 }
 
+function parseNotionPageTodos(data) {
+  if (!data.results) return [];
+  return data.results
+    .filter((block) => block.type === 'to_do' && !block.to_do?.checked)
+    .map((block) => {
+      const title = block.to_do?.rich_text?.[0]?.plain_text || 'Untitled';
+      return { id: block.id, title, type: 'personal' };
+    });
+}
 function parseNotionDatabaseTodos(data) {
   if (!data.results) return [];
   return data.results.map((page) => {
@@ -223,23 +267,37 @@ function parseNotionDatabaseTodos(data) {
     const rawType = typeProp?.select?.name || typeProp?.multi_select?.[0]?.name || '';
     const type = rawType.toLowerCase().includes('work') ? 'work' : 'personal';
 
-    return { title, type };
+    return { id: page.id, title, type };
   });
 }
 
-function parseNotionPageTodos(data) {
-  if (!data.results) return [];
-  return data.results
-    .filter((block) => block.type === 'to_do' && !block.to_do?.checked)
-    .map((block) => {
-      const title = block.to_do?.rich_text?.[0]?.plain_text || 'Untitled';
-      return { title, type: 'personal' };
-    });
+const TODO_STORAGE_KEY = `digital-typewriter:done-todos:${todayKey}`;
+
+function getStoredDoneTodos() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(TODO_STORAGE_KEY)) || []);
+  } catch (err) {
+    console.warn('Could not read saved todos:', err);
+    return new Set();
+  }
+}
+
+function saveStoredDoneTodos(doneTodos) {
+  try {
+    localStorage.setItem(TODO_STORAGE_KEY, JSON.stringify([...doneTodos]));
+  } catch (err) {
+    console.warn('Could not save todos:', err);
+  }
+}
+
+function getTodoStorageId(todo) {
+  return todo.id || `${todo.type}:${todo.title}`.toLowerCase();
 }
 
 function renderTodos(todos) {
   const todosUl = document.querySelector('.todos');
   todosUl.innerHTML = ''; // clear hardcoded placeholder HTML
+  const doneTodos = getStoredDoneTodos();
 
   if (!todos.length) {
     todosUl.innerHTML = '<li class="todo"><span class="label" style="opacity:0.5">all done! ✧</span></li>';
@@ -249,6 +307,8 @@ function renderTodos(todos) {
   todos.forEach((todo) => {
     const li = document.createElement('li');
     li.className = 'todo';
+    li.dataset.todoId = getTodoStorageId(todo);
+    if (doneTodos.has(li.dataset.todoId)) li.classList.add('done');
     li.innerHTML = `
       <span class="todo-icon todo-${todo.type}">${todo.type}</span>
       <span class="label">${todo.title}</span>
@@ -258,6 +318,40 @@ function renderTodos(todos) {
 
   // Re-attach sparkle click listeners after dynamic render
   attachTodoClickListeners();
+}
+
+function attachTodoClickListeners() {
+  document.querySelectorAll('.todos .todo').forEach((todo) => {
+    if (todo.dataset.todoListenerAttached) return;
+
+    if (!todo.dataset.todoId) {
+      const label = todo.querySelector('.label')?.textContent || '';
+      const type = todo.querySelector('.todo-icon')?.textContent || 'personal';
+      todo.dataset.todoId = `${type}:${label}`.toLowerCase();
+      if (getStoredDoneTodos().has(todo.dataset.todoId)) todo.classList.add('done');
+    }
+
+    todo.addEventListener('click', (e) => {
+      const doneTodos = getStoredDoneTodos();
+      const willBeDone = !todo.classList.contains('done');
+      todo.classList.toggle('done');
+      if (willBeDone) {
+        doneTodos.add(todo.dataset.todoId);
+      } else {
+        doneTodos.delete(todo.dataset.todoId);
+      }
+      saveStoredDoneTodos(doneTodos);
+      if (willBeDone) spawnSparkles(e.clientX, e.clientY);
+    });
+    todo.dataset.todoListenerAttached = 'true';
+  });
+}
+
+function updatePrinterReaction(count) {
+  const reaction = count > 3 ? '૮(˶ㅠ︿ㅠ)ა ' : count < 3 ? '( ˶ˆᗜˆ˵ )' : null;
+  if (reaction && !IDLE_FRAMES.includes(reaction)) {
+    IDLE_FRAMES.push(reaction);
+  }
 }
 
 // ============================================================
@@ -280,18 +374,6 @@ async function loadDailyData() {
 }
 
 loadDailyData();
-
-// const stage = document.getElementById('stage');
-// const receipt = document.getElementById('receipt');
-// const printBtn = document.getElementById('printBtn');
-// const printerText = document.querySelector('.printer-text');
-// const receiptDate = document.getElementById('receiptDate');
-
-// const randomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
-
-// // --- Receipt date stamp ---
-// const today = new Date();
-// receiptDate.textContent = `${today.getMonth() + 1}/${today.getDate()}/${today.getFullYear()}`;
 
 // --- Typewriter heading ---
 const HEADING_PREFIX = "Nasha's Daily ";
@@ -363,7 +445,7 @@ printerText.textContent = IDLE_FRAMES[0];
 const idleInterval = setInterval(() => {
   idleFrame = (idleFrame + 1) % IDLE_FRAMES.length;
   printerText.textContent = IDLE_FRAMES[idleFrame];
-}, 600);
+}, 450);
 
 // --- Todo sparkle effect lolll ---
 const SPARKLE_GLYPHS = ['✦', '✧', '⋆', '✩', '✶'];
@@ -390,13 +472,7 @@ function spawnSparkles(x, y) {
   }
 }
 
-document.querySelectorAll('.todos .todo').forEach((todo) => {
-  todo.addEventListener('click', (e) => {
-    const willBeDone = !todo.classList.contains('done');
-    todo.classList.toggle('done');
-    if (willBeDone) spawnSparkles(e.clientX, e.clientY);
-  });
-});
+attachTodoClickListeners();
 
 // --- Receipt wiggle ---
 function wiggleReceipt() {
@@ -626,3 +702,6 @@ requestAnimationFrame((t) => {
   decorLastTime = t;
   tickDecors(t);
 });
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js');
+}
